@@ -24,6 +24,12 @@
 #include "vga.h"
 #include "keyboard.h"
 #include "../include/types.h"
+#include "process.h"
+#include "interrupts.h"
+#include "scheduler.h"
+
+static volatile uint32_t process_a_count = 0;
+static volatile uint32_t process_b_count = 0;
 
 /* ---------------------------------------------------------------------------
  * Forward declarations of shell commands
@@ -33,6 +39,9 @@ static void cmd_clear(void);
 static void cmd_about(void);
 static void cmd_echo(const char *args);
 static void cmd_mem(void);
+static void cmd_ticks(void);
+static void cmd_counts(void);
+static void cmd_kill(const char *args);
 
 /* ---------------------------------------------------------------------------
  * Utility: minimal string helpers (no libc in a freestanding kernel!)
@@ -58,6 +67,49 @@ static const char *k_ltrim(const char *s) {
     while (*s == ' ') s++;
     return s;
 }
+
+
+static void k_put_uint(uint32_t value) {
+    char buffer[11];
+    int i = 0;
+
+    if (value == 0) {
+        vga_putchar('0');
+        return;
+    }
+
+    while (value > 0) {
+        buffer[i++] = '0' + (value % 10);
+        value /= 10;
+    }
+
+    while (i > 0) {
+        vga_putchar(buffer[--i]);
+    }
+}
+
+
+static int k_parse_uint(const char *str, uint32_t *value) {
+    uint32_t result = 0;
+
+    if (str == 0 || *str == '\0') {
+        return -1;
+    }
+
+    while (*str != '\0') {
+        if (*str < '0' || *str > '9') {
+            return -1;
+        }
+
+        result = result * 10 + (uint32_t)(*str - '0');
+        str++;
+    }
+
+    *value = result;
+    return 0;
+}
+
+
 
 /* ---------------------------------------------------------------------------
  * Splash Screen
@@ -159,6 +211,95 @@ static void cmd_mem(void) {
                    VGA_YELLOW, VGA_BLACK);
 }
 
+
+static void cmd_ps(void) {
+    pcb_t *process = process_get_list();
+
+    vga_puts_color("\n  PID    STATE        NAME\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+    vga_puts("  -----------------------------\n");
+
+    if (process == 0) {
+        vga_puts("  No processes found.\n");
+        return;
+    }
+
+    while (process != 0) {
+        vga_puts("  ");
+
+        k_put_uint(process->pid);
+
+        vga_puts("      ");
+        vga_puts(process_state_string(process->state));
+
+        vga_puts("        ");
+
+        if (process->name != 0) {
+            vga_puts(process->name);
+        } else {
+            vga_puts("(unnamed)");
+        }
+
+        vga_puts("\n");
+
+        process = process->next;
+    }
+}
+
+static void cmd_ticks(void) {
+    vga_puts("  Timer ticks: ");
+    k_put_uint(timer_get_ticks());
+    vga_puts("\n");
+}
+
+
+static void cmd_counts(void) {
+    vga_puts("  Process A count: ");
+    k_put_uint(process_a_count);
+    vga_puts("\n");
+
+    vga_puts("  Process B count: ");
+    k_put_uint(process_b_count);
+    vga_puts("\n");
+}
+
+
+static void cmd_kill(const char *args) {
+    uint32_t pid;
+
+    args = k_ltrim(args);
+
+    if (args == 0 || *args == '\0') {
+        vga_puts("  Usage: kill <pid>\n");
+        return;
+    }
+
+    if (k_parse_uint(args, &pid) != 0) {
+        vga_puts("  Invalid PID.\n");
+        return;
+    }
+
+    pcb_t *process = process_find(pid);
+
+    if (process == 0) {
+        vga_puts("  Process not found.\n");
+        return;
+    }
+
+    if (process == process_current()) {
+        vga_puts("  Cannot kill the currently running process.\n");
+        return;
+    }
+
+    if (process_kill(pid) == 0) {
+        vga_puts("  Process ");
+        k_put_uint(pid);
+        vga_puts(" terminated.\n");
+    } else {
+        vga_puts("  Failed to terminate process.\n");
+    }
+}
+
 /* ---------------------------------------------------------------------------
  * Shell process
  * --------------------------------------------------------------------------*/
@@ -182,15 +323,36 @@ static void shell_run(void) {
         if (k_strcmp(cmd, "clear") == 0) { cmd_clear(); continue; }
         if (k_strcmp(cmd, "about") == 0) { cmd_about(); continue; }
         if (k_strcmp(cmd, "mem")   == 0) { cmd_mem();   continue; }
+	if (k_strcmp(cmd, "ticks") == 0) { cmd_ticks(); continue; }
 
         if (k_strncmp(cmd, "echo ", 5) == 0) {
             cmd_echo(k_ltrim(cmd + 5));
             continue;
         }
 
+	if (k_strcmp(cmd, "ps") == 0) {
+    	cmd_ps();
+    	continue;
+	}
+
+	if (k_strncmp(cmd, "kill ", 5) == 0) {
+    	cmd_kill(cmd + 5);
+    	continue;
+	}
+
+	if (k_strcmp(cmd, "kill") == 0) {
+    	cmd_kill("");
+    	continue;
+	}
+	
+
+	if (k_strcmp(cmd, "counts") == 0) {
+    	cmd_counts();
+    	continue;
+	}
+
         /* Milestone stubs */
-        if (k_strcmp(cmd, "ps")      == 0 ||
-            k_strcmp(cmd, "kill")    == 0 ||
+        if (k_strcmp(cmd, "kill")    == 0 ||
             k_strcmp(cmd, "threads") == 0 ||
             k_strcmp(cmd, "free")    == 0 ||
             k_strcmp(cmd, "ls")      == 0 ||
@@ -201,11 +363,28 @@ static void shell_run(void) {
             continue;
         }
 
+	
+
         vga_puts_color("  Unknown command: ", VGA_LIGHT_RED, VGA_BLACK);
         vga_puts(cmd);
         vga_puts("\n  Type 'help' for a list of commands.\n");
     }
 }
+
+
+
+static void process_a(void) {
+    while (1) {
+        process_a_count++;
+    }
+}
+
+static void process_b(void) {
+    while (1) {
+        process_b_count++;
+    }
+}
+
 
 /* ---------------------------------------------------------------------------
  * Kernel entry point – called from kernel_entry.asm
@@ -213,9 +392,27 @@ static void shell_run(void) {
 void kernel_main(void) {
     vga_init();
     kb_init();
+    process_init();
+    scheduler_init();
+
+
+    process_create("process_a", process_a);
+    process_create("process_b", process_b);
+
+    
+    pcb_t *shell_process = process_create("shell", shell_run);
+
+    shell_process->state = PROCESS_RUNNING;
+    process_set_current(shell_process);
+
+    interrupts_init();
+
+
+    pit_init(100);
+    interrupts_enable();
+
     print_splash();
     shell_run();
 
-    /* Should never reach here */
     __asm__ __volatile__("hlt");
 }
