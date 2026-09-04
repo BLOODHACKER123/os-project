@@ -166,28 +166,3 @@ xxd seng21213-os.img | grep -c aa55  # Verify boot signature
 
 ---
 
-## Key Learning Resources
-
-| Topic | Reference |
-|-------|-----------|
-| x86 Protected Mode | Intel IA-32 Manual, Vol 3, Chapter 3 |
-| VGA Text Mode | OSDev Wiki: Text UI |
-| Interrupts / IDT | Stallings Ch.1; OSDev: IDT |
-| Process Management | Stallings Ch.3–4 (your lecture notes) |
-| Memory Management | Stallings Ch.7–8 (your lecture notes) |
-| OSDev community | https://wiki.osdev.org |
-
----
-
-## Assessment Rubric (per milestone)
-
-| Criterion | Weight |
-|-----------|--------|
-| Code compiles and kernel boots in QEMU | 30% |
-| Feature implementation (correct behaviour) | 40% |
-| Code quality and comments | 20% |
-| Lab demo and viva questions | 10% |
-
----
-
-*Happy hacking! Remember: every commercial OS started exactly like this.*
