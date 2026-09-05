@@ -7,6 +7,8 @@
 #include "thread.h"
 #include "mutex.h"
 #include "semaphore.h"
+#include "pmm.h"
+#include "e820.h"
 
 static volatile uint32_t process_a_count = 0;
 static volatile uint32_t process_b_count = 0;
@@ -55,6 +57,10 @@ static void cmd_counts(void);
 static void cmd_kill(const char *args);
 static void cmd_threads(void);
 static void cmd_pc(void);
+static void cmd_meminfo(void);
+static void cmd_pmmtest(void);
+static void cmd_e820(void);
+
 
 /* ---------------------------------------------------------------------------
  * Utility: minimal string helpers (no libc in a freestanding kernel!)
@@ -122,6 +128,64 @@ static int k_parse_uint(const char *str, uint32_t *value) {
     return 0;
 }
 
+static void init_physical_memory_from_e820(void) {
+    uint16_t count = e820_get_entry_count();
+    volatile e820_entry_t *entries = e820_get_entries();
+
+    /*
+     * pmm_init() starts with every frame marked USED.
+     */
+    pmm_init();
+
+    /*
+     * Free only regions BIOS reports as usable RAM.
+     */
+    for (uint16_t i = 0; i < count; i++) {
+
+        if (entries[i].type != E820_TYPE_USABLE) {
+            continue;
+        }
+
+        /*
+         * Our teaching PMM currently tracks only the first 32 MB.
+         * Ignore regions beginning above that limit.
+         */
+        if (entries[i].base >= PMM_MAX_MEMORY) {
+            continue;
+        }
+
+        uint32_t base = (uint32_t)entries[i].base;
+        uint32_t length = (uint32_t)entries[i].length;
+
+        /*
+         * Clamp the region if it extends beyond the PMM's
+         * current 32 MB tracking limit.
+         */
+        if (base + length > PMM_MAX_MEMORY ||
+            base + length < base) {
+
+            length = PMM_MAX_MEMORY - base;
+        }
+
+        pmm_mark_region_free(base, length);
+    }
+
+    /*
+     * IMPORTANT:
+     * Reserve the first 1 MB.
+     *
+     * This protects:
+     *   - interrupt vectors / BIOS data
+     *   - E820 map at 0x5000
+     *   - bootloader at 0x7C00
+     *   - kernel loaded at 0x10000
+     *   - kernel stack around 0x90000
+     *   - VGA / BIOS memory areas
+     *
+     * Our current kernel is loaded completely below 1 MB.
+     */
+    pmm_mark_region_used(0x00000000, 0x00100000);
+}
 
 
 /* ---------------------------------------------------------------------------
@@ -189,6 +253,9 @@ static void cmd_help(void) {
     vga_puts("  free    – [L12] Show free memory\n");
     vga_puts("  ls      – [L13] List files\n");
     vga_puts("  cat     – [L14] Print file contents\n\n");
+    vga_puts("  meminfo - [L15] Physical memory statistics\n");
+    vga_puts("  pmmtest - [L16] Test frame allocation/free\n");
+    vga_puts("  e820    - [L17] Show BIOS physical memory map\n");
 }
 
 static void cmd_clear(void) {
@@ -424,6 +491,127 @@ static void cmd_kill(const char *args) {
     }
 }
 
+    static void cmd_meminfo(void) {
+    vga_puts_color("\n  Physical Memory Manager\n",VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ------------------------------\n");
+
+    vga_puts("  Total frames : ");
+    k_put_uint(pmm_get_total_frames());
+    vga_puts("\n");
+
+    vga_puts("  Used frames  : ");
+    k_put_uint(pmm_get_used_frames());
+    vga_puts("\n");
+
+    vga_puts("  Free frames  : ");
+    k_put_uint(pmm_get_free_frames());
+    vga_puts("\n");
+
+    vga_puts("  Frame size   : 4096 bytes\n");
+  }
+
+
+static void cmd_pmmtest(void) {
+    uint32_t before_free;
+    uint32_t after_alloc;
+    uint32_t after_free;
+    uint32_t frame;
+
+    vga_puts_color("\n  PMM Allocation Test\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ------------------------------\n");
+
+    before_free = pmm_get_free_frames();
+
+    vga_puts("  Free before allocate : ");
+    k_put_uint(before_free);
+    vga_puts("\n");
+
+    frame = pmm_alloc_frame();
+
+    if (frame == 0) {
+        vga_puts("  Allocation failed.\n");
+        return;
+    }
+
+    after_alloc = pmm_get_free_frames();
+
+    vga_puts("  Allocated frame addr : ");
+    k_put_uint(frame);
+    vga_puts("\n");
+
+    vga_puts("  Free after allocate  : ");
+    k_put_uint(after_alloc);
+    vga_puts("\n");
+
+    pmm_free_frame(frame);
+
+    after_free = pmm_get_free_frames();
+
+    vga_puts("  Free after free      : ");
+    k_put_uint(after_free);
+    vga_puts("\n");
+
+    if (after_alloc + 1 == before_free &&
+        after_free == before_free) {
+
+        vga_puts_color("  PMM test: PASS\n",
+                       VGA_LIGHT_GREEN, VGA_BLACK);
+    } else {
+        vga_puts_color("  PMM test: FAIL\n",
+                       VGA_LIGHT_RED, VGA_BLACK);
+    }
+}
+
+static void cmd_e820(void) {
+    uint16_t count = e820_get_entry_count();
+    volatile e820_entry_t *entries = e820_get_entries();
+
+    vga_puts_color("\n  BIOS E820 Memory Map\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ------------------------------------------\n");
+
+    vga_puts("  Entry count: ");
+    k_put_uint(count);
+    vga_puts("\n\n");
+
+    for (uint16_t i = 0; i < count; i++) {
+        /*
+         * Our current kernel is 32-bit, so for this teaching OS
+         * we display the lower 32 bits of base and length.
+         */
+        uint32_t base_low =
+            (uint32_t)(entries[i].base & 0xFFFFFFFFu);
+
+        uint32_t length_low =
+            (uint32_t)(entries[i].length & 0xFFFFFFFFu);
+
+        vga_puts("  Entry ");
+        k_put_uint(i);
+
+        vga_puts(": base=");
+        k_put_uint(base_low);
+
+        vga_puts(" length=");
+        k_put_uint(length_low);
+
+        vga_puts(" type=");
+        k_put_uint(entries[i].type);
+
+        if (entries[i].type == E820_TYPE_USABLE) {
+            vga_puts(" [USABLE]");
+        } else {
+            vga_puts(" [RESERVED]");
+        }
+
+        vga_puts("\n");
+    }
+}
+
+
 /* ---------------------------------------------------------------------------
  * Shell process
  * --------------------------------------------------------------------------*/
@@ -485,6 +673,21 @@ static void shell_run(void) {
     	continue;
 	}
 
+	if (k_strcmp(cmd, "meminfo") == 0) {
+    	cmd_meminfo();
+    	continue;
+	}
+
+	if (k_strcmp(cmd, "pmmtest") == 0) {
+    	cmd_pmmtest();
+    	continue;
+	}
+
+	if (k_strcmp(cmd, "e820") == 0) {
+    	cmd_e820();
+    	continue;
+	}
+
         /* Milestone stubs */
         if (k_strcmp(cmd, "kill")    == 0 ||
             k_strcmp(cmd, "threads") == 0 ||
@@ -502,22 +705,22 @@ static void shell_run(void) {
         vga_puts_color("  Unknown command: ", VGA_LIGHT_RED, VGA_BLACK);
         vga_puts(cmd);
         vga_puts("\n  Type 'help' for a list of commands.\n");
-    }
-}
+    	}
+	}
 
 
 
 	static void process_a(void) {
     	while (1) {
         process_a_count++;
-    }
-}
+   	}
+	}
 
 	static void process_b(void) {
     	while (1) {
         process_b_count++;
-    }
-}
+    	}
+	}
 
 
 /*
@@ -664,6 +867,8 @@ void kernel_main(void) {
     process_init();
     thread_init();
     scheduler_init();
+    
+    init_physical_memory_from_e820();	
 
     mutex_init(&counter_mutex);
     semaphore_init(&counter_semaphore, 1);

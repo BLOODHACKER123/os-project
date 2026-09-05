@@ -9,6 +9,19 @@
 [BITS 16]           ; CPU starts in 16-bit Real Mode
 [ORG 0x7C00]        ; BIOS loads the MBR at this fixed address
 
+
+; ---------------------------------------------------------------------------
+; BIOS E820 memory map storage
+;
+; 0x5000 = number of entries (16-bit)
+; 0x5004 = first E820 entry
+;
+; Each E820 entry is 24 bytes.
+; ---------------------------------------------------------------------------
+E820_COUNT_ADDR  equ 0x5000
+E820_BUFFER_ADDR equ 0x5004
+E820_ENTRY_SIZE  equ 24
+
 ; ---------------------------------------------------------------------------
 ; Entry: Real Mode setup
 ; ---------------------------------------------------------------------------
@@ -27,8 +40,13 @@ start:
     ; Print loading banner using BIOS int 0x10
     mov  si, msg_banner
     call print_rm
-    mov  si, msg_load
+
+     mov  si, msg_load
     call print_rm
+
+    ; Ask BIOS for the physical memory map while we are
+    ; still running in 16-bit Real Mode.
+    call detect_memory
 
 ; ---------------------------------------------------------------------------
 ; Load kernel: read sectors 2..65 from disk into memory at 0x1000:0x0000
@@ -88,16 +106,80 @@ init_pm32:
     ; Should never return, but halt if it does
     hlt
 
+
+; ---------------------------------------------------------------------------
+; BIOS E820 Memory Detection
+;
+; Stores:
+;   [0x5000] = number of entries
+;   [0x5004] = entry 0
+;   [0x501C] = entry 1
+;   ...
+;
+; Entry format (24 bytes):
+;   +0  : base address low
+;   +4  : base address high
+;   +8  : length low
+;   +12 : length high
+;   +16 : type
+;   +20 : extended attributes
+; ---------------------------------------------------------------------------
+[BITS 16]
+detect_memory:
+    pushad
+
+    xor ax, ax
+    mov es, ax
+
+    mov word [E820_COUNT_ADDR], 0
+
+    mov di, E820_BUFFER_ADDR
+    xor ebx, ebx
+
+
+.e820_loop:
+    mov eax, 0xE820
+
+    ; "SMAP"
+    mov edx, 0x534D4150
+
+    ; Request 24-byte entries.
+    mov ecx, E820_ENTRY_SIZE
+
+    ; Clear extended attributes field before BIOS call.
+    mov dword [es:di + 20], 0
+
+    int 0x15
+    jc .e820_done
+
+    ; BIOS must return "SMAP" in EAX.
+    cmp eax, 0x534D4150
+    jne .e820_done
+
+    ; We successfully received one entry.
+    inc word [E820_COUNT_ADDR]
+
+    ; Move DI to the next 24-byte slot.
+    add di, E820_ENTRY_SIZE
+
+    ; EBX == 0 means there are no more entries.
+    test ebx, ebx
+    jnz .e820_loop
+
+.e820_done:
+    popad
+    ret
+
+
 ; ---------------------------------------------------------------------------
 ; Error handlers
 ; ---------------------------------------------------------------------------
-[BITS 16]
 disk_error:
     mov  si, msg_err
     call print_rm
     mov  si, msg_halt
     call print_rm
-    jmp  $              ; Infinite loop
+    jmp  $            ; Infinite loop
 
 ; ---------------------------------------------------------------------------
 ; Subroutine: print_rm – print NUL-terminated string in SI (Real Mode)
