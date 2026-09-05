@@ -55,7 +55,10 @@ KERNEL_C_SRCS := kernel/kernel.c \
                  kernel/keyboard.c \
                  kernel/process.c \
                  kernel/interrupts.c \
-                 kernel/scheduler.c
+                 kernel/scheduler.c \
+                 kernel/thread.c \
+                 kernel/mutex.c \
+		 kernel/semaphore.c
 
 
 # Add your new source files below as the course progresses:
