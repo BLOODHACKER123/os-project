@@ -1,35 +1,46 @@
-/* =============================================================================
- * SENG21213-OS :: Main Kernel  (Stage 0 – Foundations)
- * File   : kernel/kernel.c
- *
- * PURPOSE
- *   This is the heart of your operating system. Right now it:
- *     1. Initialises VGA text-mode display
- *     2. Initialises the keyboard driver
- *     3. Prints a splash screen
- *     4. Runs a minimal interactive shell ("ksh")
- *
- * ASSIGNMENT MILESTONES  (what YOU will add in later lectures)
- *   Lecture  9  – Process Management  →  process.h / process.c / scheduler.c
- *   Lecture 10  – Threads             →  thread.h  / thread.c
- *   Lecture 11  – Memory Management   →  pmm.h     / pmm.c / vmm.c
- *   Lecture 12  – File System         →  fs.h      / fs.c
- *
- * CODING CONVENTION
- *   - Prefix kernel-internal functions with k_ (e.g. k_strcmp)
- *   - All driver APIs live in their own .h/.c pair
- *   - NEVER call malloc – use the PMM you build in Lecture 11
- * ============================================================================*/
-
 #include "vga.h"
 #include "keyboard.h"
 #include "../include/types.h"
 #include "process.h"
 #include "interrupts.h"
 #include "scheduler.h"
+#include "thread.h"
+#include "mutex.h"
+#include "semaphore.h"
 
 static volatile uint32_t process_a_count = 0;
 static volatile uint32_t process_b_count = 0;
+
+static volatile uint32_t thread_a_count = 0;
+static volatile uint32_t thread_b_count = 0;
+
+static volatile uint32_t race_shared_count = 0;
+
+static volatile uint32_t mutex_shared_count = 0;
+static mutex_t counter_mutex;
+
+static volatile uint32_t semaphore_shared_count = 0;
+static semaphore_t counter_semaphore;
+
+#define PC_BUFFER_SIZE 5
+
+static int pc_buffer[PC_BUFFER_SIZE];
+
+static uint32_t pc_in = 0;
+static uint32_t pc_out = 0;
+
+static volatile uint32_t produced_count = 0;
+static volatile uint32_t consumed_count = 0;
+
+static volatile int last_produced = 0;
+static volatile int last_consumed = 0;
+
+static int next_item = 1;
+
+static mutex_t pc_mutex;
+static semaphore_t empty_slots;
+static semaphore_t full_slots;
+
 
 /* ---------------------------------------------------------------------------
  * Forward declarations of shell commands
@@ -42,6 +53,8 @@ static void cmd_mem(void);
 static void cmd_ticks(void);
 static void cmd_counts(void);
 static void cmd_kill(const char *args);
+static void cmd_threads(void);
+static void cmd_pc(void);
 
 /* ---------------------------------------------------------------------------
  * Utility: minimal string helpers (no libc in a freestanding kernel!)
@@ -172,9 +185,10 @@ static void cmd_help(void) {
     vga_puts("  ps      – [L09] List processes\n");
     vga_puts("  kill    – [L09] Terminate a process\n");
     vga_puts("  threads – [L10] List kernel threads\n");
-    vga_puts("  free    – [L11] Show free memory\n");
-    vga_puts("  ls      – [L12] List files\n");
-    vga_puts("  cat     – [L12] Print file contents\n\n");
+    vga_puts("  pc      - [L11] Producer-consumer status\n");
+    vga_puts("  free    – [L12] Show free memory\n");
+    vga_puts("  ls      – [L13] List files\n");
+    vga_puts("  cat     – [L14] Print file contents\n\n");
 }
 
 static void cmd_clear(void) {
@@ -246,6 +260,96 @@ static void cmd_ps(void) {
     }
 }
 
+
+static void cmd_threads(void) {
+    thread_t *thread = thread_get_list();
+
+    vga_puts_color("\n  TID    PID    STATE        NAME\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ----------------------------------\n");
+
+    if (thread == 0) {
+        vga_puts("  No threads found.\n");
+        return;
+    }
+
+    while (thread != 0) {
+        vga_puts("  ");
+
+        k_put_uint(thread->tid);
+
+        vga_puts("      ");
+
+        k_put_uint(thread->owner_pid);
+
+        vga_puts("      ");
+
+        vga_puts(thread_state_string(thread->state));
+
+        vga_puts("        ");
+
+        if (thread->name != 0) {
+            vga_puts(thread->name);
+        } else {
+            vga_puts("(unnamed)");
+        }
+
+        vga_puts("\n");
+
+        thread = thread->next;
+    }
+}
+
+
+static void cmd_pc(void) {
+    uint32_t produced;
+    uint32_t consumed;
+    int produced_item;
+    int consumed_item;
+
+    /*
+     * Take a consistent snapshot of the shared
+     * producer-consumer state.
+     */
+    mutex_lock(&pc_mutex);
+
+    produced = produced_count;
+    consumed = consumed_count;
+    produced_item = last_produced;
+    consumed_item = last_consumed;
+
+    mutex_unlock(&pc_mutex);
+
+    vga_puts_color("\n  Producer-Consumer Status\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ------------------------------\n");
+
+    vga_puts("  Produced       : ");
+    k_put_uint(produced);
+    vga_puts("\n");
+
+    vga_puts("  Consumed       : ");
+    k_put_uint(consumed);
+    vga_puts("\n");
+
+    vga_puts("  Last produced  : ");
+    k_put_uint((uint32_t)produced_item);
+    vga_puts("\n");
+
+    vga_puts("  Last consumed  : ");
+    k_put_uint((uint32_t)consumed_item);
+    vga_puts("\n");
+
+    vga_puts("  Buffer used    : ");
+    k_put_uint(produced - consumed);
+    vga_puts(" / ");
+    k_put_uint(PC_BUFFER_SIZE);
+    vga_puts("\n");
+}
+
+
 static void cmd_ticks(void) {
     vga_puts("  Timer ticks: ");
     k_put_uint(timer_get_ticks());
@@ -254,12 +358,32 @@ static void cmd_ticks(void) {
 
 
 static void cmd_counts(void) {
-    vga_puts("  Process A count: ");
+    vga_puts("  Process A count : ");
     k_put_uint(process_a_count);
     vga_puts("\n");
 
-    vga_puts("  Process B count: ");
+    vga_puts("  Process B count : ");
     k_put_uint(process_b_count);
+    vga_puts("\n");
+
+    vga_puts("  Thread A count  : ");
+    k_put_uint(thread_a_count);
+    vga_puts("\n");
+
+    vga_puts("  Thread B count  : ");
+    k_put_uint(thread_b_count);
+    vga_puts("\n");
+
+    vga_puts("  Mutex shared    : ");
+    k_put_uint(mutex_shared_count);
+    vga_puts("\n");
+
+    vga_puts("  Race shared     : ");
+    k_put_uint(race_shared_count);
+    vga_puts("\n");
+
+    vga_puts("  Semaphore shared: ");
+    k_put_uint(semaphore_shared_count);
     vga_puts("\n");
 }
 
@@ -335,6 +459,16 @@ static void shell_run(void) {
     	continue;
 	}
 
+	if (k_strcmp(cmd, "threads") == 0) {
+   	cmd_threads();
+    	continue;
+	}
+
+	if (k_strcmp(cmd, "pc") == 0) {
+    	cmd_pc();
+    	continue;
+	}
+
 	if (k_strncmp(cmd, "kill ", 5) == 0) {
     	cmd_kill(cmd + 5);
     	continue;
@@ -373,17 +507,151 @@ static void shell_run(void) {
 
 
 
-static void process_a(void) {
-    while (1) {
+	static void process_a(void) {
+    	while (1) {
         process_a_count++;
     }
 }
 
-static void process_b(void) {
-    while (1) {
+	static void process_b(void) {
+    	while (1) {
         process_b_count++;
     }
 }
+
+
+/*
+ * Intentionally unsafe increment used only
+ * to demonstrate a race condition.
+ */
+static void unsafe_race_increment(void) {
+    uint32_t temp = race_shared_count;
+
+    /*
+     * Widen the race window so the PIT has a better
+     * chance of switching threads before the write.
+     */
+    for (volatile uint32_t i = 0; i < 50000; i++) {
+        /* intentional delay */
+    }
+
+    race_shared_count = temp + 1;
+}
+
+/*thread a*/
+
+static void thread_a(void) {
+    while (1) {
+
+        /* Intentionally unsafe */
+        unsafe_race_increment();
+
+        /* Protected by mutex */
+        mutex_lock(&counter_mutex);
+
+        thread_a_count++;
+        mutex_shared_count++;
+
+        mutex_unlock(&counter_mutex);
+
+
+        /* Protected by semaphore */
+        semaphore_wait(&counter_semaphore);
+
+        semaphore_shared_count++;
+
+        semaphore_signal(&counter_semaphore);
+    }
+}
+
+
+/*thread b*/
+static void thread_b(void) {
+    while (1) {
+
+        /* Intentionally unsafe */
+        unsafe_race_increment();
+
+        /* Protected by mutex */
+        mutex_lock(&counter_mutex);
+
+        thread_b_count++;
+        mutex_shared_count++;
+
+        mutex_unlock(&counter_mutex);
+
+
+        /* Protected by semaphore */
+        semaphore_wait(&counter_semaphore);
+
+        semaphore_shared_count++;
+
+        semaphore_signal(&counter_semaphore);
+    }
+}
+
+
+
+static void producer_thread(void) {
+    while (1) {
+
+        /*
+         * Wait until at least one empty
+         * buffer slot is available.
+         */
+        semaphore_wait(&empty_slots);
+
+        /*
+         * Protect the shared buffer.
+         */
+        mutex_lock(&pc_mutex);
+
+        int item = next_item++;
+
+        pc_buffer[pc_in] = item;
+        pc_in = (pc_in + 1) % PC_BUFFER_SIZE;
+
+        last_produced = item;
+        produced_count++;
+
+        mutex_unlock(&pc_mutex);
+
+        /*
+         * One more full slot is now available.
+         */
+        semaphore_signal(&full_slots);
+    }
+}
+
+
+static void consumer_thread(void) {
+    while (1) {
+
+        /*
+         * Wait until there is an item
+         * available to consume.
+         */
+        semaphore_wait(&full_slots);
+
+        mutex_lock(&pc_mutex);
+
+        int item = pc_buffer[pc_out];
+
+        pc_out = (pc_out + 1) % PC_BUFFER_SIZE;
+
+        last_consumed = item;
+        consumed_count++;
+
+        mutex_unlock(&pc_mutex);
+
+        /*
+         * One more empty slot is now available.
+         */
+        semaphore_signal(&empty_slots);
+    }
+}
+
+
 
 
 /* ---------------------------------------------------------------------------
@@ -392,12 +660,30 @@ static void process_b(void) {
 void kernel_main(void) {
     vga_init();
     kb_init();
+
     process_init();
+    thread_init();
     scheduler_init();
 
+    mutex_init(&counter_mutex);
+    semaphore_init(&counter_semaphore, 1);
 
-    process_create("process_a", process_a);
-    process_create("process_b", process_b);
+    mutex_init(&pc_mutex);
+
+    semaphore_init(&empty_slots, PC_BUFFER_SIZE);
+    semaphore_init(&full_slots, 0);
+    
+
+
+    pcb_t *proc_a = process_create("process_a", process_a);
+    pcb_t *proc_b = process_create("process_b", process_b);
+
+
+    thread_create("thread_a", thread_a, proc_a->pid);
+    thread_create("thread_b", thread_b, proc_b->pid);
+
+    thread_create("producer", producer_thread, proc_a->pid);
+    thread_create("consumer", consumer_thread, proc_b->pid);
 
     
     pcb_t *shell_process = process_create("shell", shell_run);
