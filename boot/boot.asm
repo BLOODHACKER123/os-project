@@ -96,8 +96,9 @@ init_pm32:
     mov  fs, ax
     mov  gs, ax
 
-    ; Set up a proper kernel stack at 0x90000
-    mov  ebp, 0x90000
+    ; Set up kernel stack at 2 MB.
+    ; This keeps the stack above the kernel's current .bss / RAM disk.
+    mov  ebp, 0x00200000
     mov  esp, ebp
 
     ; Jump to the kernel entry point (loaded at 0x10000)

@@ -9,6 +9,7 @@
 #include "semaphore.h"
 #include "pmm.h"
 #include "e820.h"
+#include "fs.h"
 
 static volatile uint32_t process_a_count = 0;
 static volatile uint32_t process_b_count = 0;
@@ -43,6 +44,10 @@ static mutex_t pc_mutex;
 static semaphore_t empty_slots;
 static semaphore_t full_slots;
 
+static char cat_buffer[(8 * FS_BLOCK_SIZE) + 1];
+
+extern char kernel_end;
+
 
 /* ---------------------------------------------------------------------------
  * Forward declarations of shell commands
@@ -60,6 +65,12 @@ static void cmd_pc(void);
 static void cmd_meminfo(void);
 static void cmd_pmmtest(void);
 static void cmd_e820(void);
+static void cmd_fsinfo(void);
+static void cmd_touch(const char *args);
+static void cmd_ls(void);
+static void cmd_write(const char *args);
+static void cmd_cat(const char *args);
+static void cmd_rm(const char *args);
 
 
 /* ---------------------------------------------------------------------------
@@ -132,24 +143,16 @@ static void init_physical_memory_from_e820(void) {
     uint16_t count = e820_get_entry_count();
     volatile e820_entry_t *entries = e820_get_entries();
 
-    /*
-     * pmm_init() starts with every frame marked USED.
-     */
     pmm_init();
 
-    /*
-     * Free only regions BIOS reports as usable RAM.
-     */
+    
     for (uint16_t i = 0; i < count; i++) {
 
         if (entries[i].type != E820_TYPE_USABLE) {
             continue;
         }
 
-        /*
-         * Our teaching PMM currently tracks only the first 32 MB.
-         * Ignore regions beginning above that limit.
-         */
+        
         if (entries[i].base >= PMM_MAX_MEMORY) {
             continue;
         }
@@ -157,10 +160,7 @@ static void init_physical_memory_from_e820(void) {
         uint32_t base = (uint32_t)entries[i].base;
         uint32_t length = (uint32_t)entries[i].length;
 
-        /*
-         * Clamp the region if it extends beyond the PMM's
-         * current 32 MB tracking limit.
-         */
+        
         if (base + length > PMM_MAX_MEMORY ||
             base + length < base) {
 
@@ -170,21 +170,8 @@ static void init_physical_memory_from_e820(void) {
         pmm_mark_region_free(base, length);
     }
 
-    /*
-     * IMPORTANT:
-     * Reserve the first 1 MB.
-     *
-     * This protects:
-     *   - interrupt vectors / BIOS data
-     *   - E820 map at 0x5000
-     *   - bootloader at 0x7C00
-     *   - kernel loaded at 0x10000
-     *   - kernel stack around 0x90000
-     *   - VGA / BIOS memory areas
-     *
-     * Our current kernel is loaded completely below 1 MB.
-     */
-    pmm_mark_region_used(0x00000000, 0x00100000);
+    pmm_mark_region_used( 0x00000000,(uint32_t)&kernel_end);
+    pmm_mark_region_used(0x001FF000,PMM_FRAME_SIZE);
 }
 
 
@@ -256,6 +243,13 @@ static void cmd_help(void) {
     vga_puts("  meminfo - [L15] Physical memory statistics\n");
     vga_puts("  pmmtest - [L16] Test frame allocation/free\n");
     vga_puts("  e820    - [L17] Show BIOS physical memory map\n");
+    vga_puts("  fsinfo  - [L18] RAM disk filesystem information\n");
+    vga_puts("  touch   - [L19] Create an empty file\n");
+    vga_puts("  ls      - [L20] List files in RAM disk\n");
+    vga_puts("  write   - [L21] Write text to a file\n");
+    vga_puts("  cat     - [L22] Display file contents\n");
+    vga_puts("  rm      - [L23] Delete a file\n");
+    
 }
 
 static void cmd_clear(void) {
@@ -375,10 +369,8 @@ static void cmd_pc(void) {
     int produced_item;
     int consumed_item;
 
-    /*
-     * Take a consistent snapshot of the shared
-     * producer-consumer state.
-     */
+  
+
     mutex_lock(&pc_mutex);
 
     produced = produced_count;
@@ -512,11 +504,11 @@ static void cmd_kill(const char *args) {
   }
 
 
-static void cmd_pmmtest(void) {
-    uint32_t before_free;
-    uint32_t after_alloc;
-    uint32_t after_free;
-    uint32_t frame;
+    static void cmd_pmmtest(void) {
+     uint32_t before_free;
+     uint32_t after_alloc;
+     uint32_t after_free;
+     uint32_t frame;
 
     vga_puts_color("\n  PMM Allocation Test\n",
                    VGA_LIGHT_CYAN, VGA_BLACK);
@@ -565,6 +557,244 @@ static void cmd_pmmtest(void) {
     }
 }
 
+
+static void cmd_fsinfo(void) {
+    fs_superblock_t *sb = fs_get_superblock();
+
+    vga_puts_color("\n  RAM Disk File System\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ------------------------------\n");
+
+    vga_puts("  Total blocks : ");
+    k_put_uint(sb->total_blocks);
+    vga_puts("\n");
+
+    vga_puts("  Free blocks  : ");
+    k_put_uint(sb->free_blocks);
+    vga_puts("\n");
+
+    vga_puts("  Total inodes : ");
+    k_put_uint(sb->total_inodes);
+    vga_puts("\n");
+
+    vga_puts("  Free inodes  : ");
+    k_put_uint(sb->free_inodes);
+    vga_puts("\n");
+
+    vga_puts("  Block size   : 512 bytes\n");
+    vga_puts("  RAM disk     : 1 MB\n");
+}
+
+
+static void cmd_touch(const char *args) {
+    args = k_ltrim(args);
+
+    if (args == 0 || *args == '\0') {
+        vga_puts("  Usage: touch <filename>\n");
+        return;
+    }
+
+    int result = fs_create(args);
+
+    if (result == 0) {
+        vga_puts("  Created file: ");
+        vga_puts(args);
+        vga_puts("\n");
+    }
+    else if (result == -2) {
+        vga_puts("  File already exists.\n");
+    }
+    else if (result == -3) {
+        vga_puts("  No free inodes available.\n");
+    }
+    else {
+        vga_puts("  Invalid filename.\n");
+    }
+}
+
+
+
+static void cmd_ls(void) {
+    uint32_t file_count = 0;
+
+    vga_puts_color("\n  Files\n",
+                   VGA_LIGHT_CYAN, VGA_BLACK);
+
+    vga_puts("  ------------------------------------------\n");
+    vga_puts("  NAME                            SIZE\n");
+    vga_puts("  ------------------------------------------\n");
+
+    for (uint32_t i = 0; i < FS_MAX_INODES; i++) {
+        fs_inode_t *inode = fs_get_inode(i);
+
+        if (inode == 0 || !inode->used) {
+            continue;
+        }
+
+        vga_puts("  ");
+        vga_puts(inode->name);
+
+        uint32_t length = 0;
+        while (inode->name[length] != '\0') {
+            length++;
+        }
+
+        while (length < 32) {
+            vga_puts(" ");
+            length++;
+        }
+
+        k_put_uint(inode->size);
+        vga_puts(" bytes\n");
+
+        file_count++;
+    }
+
+    if (file_count == 0) {
+        vga_puts("  <no files>\n");
+    }
+
+    vga_puts("\n  Total files: ");
+    k_put_uint(file_count);
+    vga_puts("\n");
+}
+
+
+static void cmd_write(const char *args) {
+    args = k_ltrim(args);
+
+    if (args == 0 || *args == '\0') {
+        vga_puts("  Usage: write <filename> <text>\n");
+        return;
+    }
+
+    /*
+     * write hello.txt Hello world
+     * into:
+     * filename = "hello.txt"
+     * data     = "Hello world"
+     */
+
+    const char *space = args;
+
+    while (*space != '\0' && *space != ' ') {
+        space++;
+    }
+
+    if (*space == '\0') {
+        vga_puts("  Usage: write <filename> <text>\n");
+        return;
+    }
+
+
+    /* Copy filename into a temporary buffer. */
+
+    char filename[FS_MAX_FILENAME];
+    uint32_t i = 0;
+
+    while (args[i] != '\0' &&
+           args[i] != ' ' &&
+           i < FS_MAX_FILENAME - 1) {
+
+        filename[i] = args[i];
+        i++;
+    }
+
+    filename[i] = '\0';
+
+
+    /* Skip spaces before file contents.*/
+
+    const char *data = space;
+
+    while (*data == ' ') {
+        data++;
+    }
+
+    int result = fs_write(filename, data);
+
+    if (result == 0) {
+        vga_puts("  Written to: ");
+        vga_puts(filename);
+        vga_puts("\n");
+    }
+    else if (result == -2) {
+        vga_puts("  File not found.\n");
+    }
+    else if (result == -3) {
+        vga_puts("  File too large. Maximum size is 4096 bytes.\n");
+    }
+    else if (result == -4) {
+        vga_puts("  Not enough free blocks.\n");
+    }
+    else {
+        vga_puts("  Write failed.\n");
+    }
+}
+
+
+
+static void cmd_cat(const char *args) {
+    args = k_ltrim(args);
+
+    if (args == 0 || *args == '\0') {
+        vga_puts("  Usage: cat <filename>\n");
+        return;
+    }
+
+    int result = fs_read(
+        args,
+        cat_buffer,
+        sizeof(cat_buffer)
+    );
+
+    if (result == -2) {
+        vga_puts("  File not found.\n");
+        return;
+    }
+
+    if (result < 0) {
+        vga_puts("  Failed to read file.\n");
+        return;
+    }
+
+    vga_puts("\n");
+
+    if (result == 0) {
+        vga_puts("  <empty file>");
+    } else {
+        vga_puts(cat_buffer);
+    }
+
+    vga_puts("\n");
+}
+
+
+static void cmd_rm(const char *args) {
+    args = k_ltrim(args);
+
+    if (args == 0 || *args == '\0') {
+        vga_puts("  Usage: rm <filename>\n");
+        return;
+    }
+
+    int result = fs_delete(args);
+
+    if (result == 0) {
+        vga_puts("  Deleted: ");
+        vga_puts(args);
+        vga_puts("\n");
+    }
+    else if (result == -2) {
+        vga_puts("  File not found.\n");
+    }
+    else {
+        vga_puts("  Delete failed.\n");
+    }
+}
+
+
 static void cmd_e820(void) {
     uint16_t count = e820_get_entry_count();
     volatile e820_entry_t *entries = e820_get_entries();
@@ -579,10 +809,12 @@ static void cmd_e820(void) {
     vga_puts("\n\n");
 
     for (uint16_t i = 0; i < count; i++) {
+
         /*
          * Our current kernel is 32-bit, so for this teaching OS
          * we display the lower 32 bits of base and length.
          */
+
         uint32_t base_low =
             (uint32_t)(entries[i].base & 0xFFFFFFFFu);
 
@@ -688,6 +920,79 @@ static void shell_run(void) {
     	continue;
 	}
 
+	if (k_strcmp(cmd, "fsinfo") == 0) {
+   	cmd_fsinfo();
+    	continue;
+	}
+
+
+	if (k_strcmp(cmd, "touch") == 0) {
+    	cmd_touch("");
+    	continue;
+	}
+
+	
+	if (cmd[0] == 't' &&
+    	cmd[1] == 'o' &&
+    	cmd[2] == 'u' &&
+    	cmd[3] == 'c' &&
+    	cmd[4] == 'h' &&
+    	cmd[5] == ' ') {
+
+   	cmd_touch(cmd + 6);
+    	continue;
+	}
+
+
+	if (k_strcmp(cmd, "ls") == 0) {
+    	cmd_ls();
+    	continue;
+	}
+
+	
+	if (k_strcmp(cmd, "write") == 0) {
+    	cmd_write("");
+    	continue;
+	}
+
+	if (cmd[0] == 'w' &&
+    	cmd[1] == 'r' &&
+    	cmd[2] == 'i' &&
+    	cmd[3] == 't' &&
+    	cmd[4] == 'e' &&
+    	cmd[5] == ' ') {
+
+    	cmd_write(cmd + 6);
+    	continue;
+	}	
+
+	if (k_strcmp(cmd, "cat") == 0) {
+    	cmd_cat("");
+    	continue;
+	}
+
+	if (cmd[0] == 'c' &&
+    	cmd[1] == 'a' &&
+    	cmd[2] == 't' &&
+    	cmd[3] == ' ') {
+
+    	cmd_cat(cmd + 4);
+    	continue;
+	}
+
+	if (k_strcmp(cmd, "rm") == 0) {
+    	cmd_rm("");
+    	continue;
+	}
+
+	if (cmd[0] == 'r' &&
+    	cmd[1] == 'm' &&
+    	cmd[2] == ' ') {
+
+    	cmd_rm(cmd + 3);
+    	continue;
+	}
+
         /* Milestone stubs */
         if (k_strcmp(cmd, "kill")    == 0 ||
             k_strcmp(cmd, "threads") == 0 ||
@@ -721,6 +1026,8 @@ static void shell_run(void) {
         process_b_count++;
     	}
 	}
+
+
 
 
 /*
@@ -867,8 +1174,10 @@ void kernel_main(void) {
     process_init();
     thread_init();
     scheduler_init();
+   
     
-    init_physical_memory_from_e820();	
+    init_physical_memory_from_e820();
+    fs_init();	
 
     mutex_init(&counter_mutex);
     semaphore_init(&counter_semaphore, 1);

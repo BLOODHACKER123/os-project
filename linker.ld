@@ -27,9 +27,11 @@ SECTIONS {
     }
 
     .bss : {
-        *(COMMON)
-        *(.bss)           /* Uninitialised data – zeroed by convention */
+    *(COMMON)
+    *(.bss)
     }
+
+    kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame)      /* Exception frames – not needed in a bare kernel */

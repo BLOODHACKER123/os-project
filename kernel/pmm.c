@@ -135,9 +135,7 @@ void pmm_mark_region_free(uint32_t base, uint32_t length) {
 }
 
 
-/*
- * Mark a region as reserved/used.
- */
+
 
 void pmm_mark_region_used(uint32_t base, uint32_t length) {
     uint32_t region_end;
